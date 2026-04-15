@@ -1,0 +1,81 @@
+name: Semantic Diff
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  semantic-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.6"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install TypeScript language server
+        run: bun install -g typescript-language-server
+
+      - name: Restore symbol cache
+        uses: actions/cache@v4
+        with:
+          path: .lsptkns-cache
+          key: lsptkns-symbols-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            lsptkns-symbols-${{ github.ref_name }}-
+            lsptkns-symbols-
+
+      - name: Restore previous snapshot
+        uses: actions/cache/restore@v4
+        with:
+          path: snapshots/before.json
+          key: lsptkns-snapshot-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            lsptkns-snapshot-${{ github.ref_name }}-
+
+      - name: Generate current snapshot
+        run: |
+          mkdir -p snapshots
+          bun run lsptkns symbols -w . -l typescript --cache-dir .lsptkns-cache > snapshots/after.json
+
+      - name: Generate previous snapshot from parent commit
+        if: ${{ hashFiles('snapshots/before.json') == '' }}
+        run: |
+          git worktree add ../prev-commit HEAD~1
+          cd ../prev-commit
+          bun install --frozen-lockfile
+          bun run lsptkns symbols -w . -l typescript > ${{ github.workspace }}/snapshots/before.json
+          cd ${{ github.workspace }}
+          git worktree remove ../prev-commit
+
+      - name: Compute semantic diff
+        run: |
+          DIFF_OUTPUT=$(bun run lsptkns diff snapshots/before.json snapshots/after.json --format human)
+          {
+            echo "## Semantic Diff"
+            echo ""
+            echo "**Commit:** \`${{ github.sha }}\`"
+            echo ""
+            echo '```'
+            echo "$DIFF_OUTPUT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare snapshot for next run
+        run: cp snapshots/after.json snapshots/before.json
+
+      - name: Save current snapshot
+        if: ${{ always() && hashFiles('snapshots/after.json') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: snapshots/before.json
+          key: lsptkns-snapshot-${{ github.ref_name }}-${{ github.sha }}
