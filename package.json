@@ -1,0 +1,25 @@
+{
+  "name": "lsp-tkn-grep",
+  "version": "0.1.0",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "lsptkns": "src/bin.ts"
+  },
+  "scripts": {
+    "dev": "bun src/bin.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "commander": "^14.0.3",
+    "ts-lsp-client": "^1.1.1"
+  }
+}

@@ -1,0 +1,259 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Bump version
+    runs-on: depot-ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+      skipped: ${{ steps.bump.outputs.skipped }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version bump
+        id: bump
+        run: |
+          # Get the latest tag
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          LATEST_VERSION=${LATEST_TAG#v}
+
+          # Parse semver
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST_VERSION"
+
+          # Check commit messages since last tag for bump hints
+          COMMITS=$(git log "${LATEST_TAG}..HEAD" --pretty=format:"%s" 2>/dev/null || git log --pretty=format:"%s")
+
+          if echo "$COMMITS" | grep -qiE "^(BREAKING|feat!|fix!|refactor!)"; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif echo "$COMMITS" | grep -qiE "^feat"; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          NEW_TAG="v${NEW_VERSION}"
+
+          # Skip if no new commits since last tag
+          if [ "$NEW_TAG" = "$LATEST_TAG" ]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "No new commits since ${LATEST_TAG}, skipping release."
+            exit 0
+          fi
+
+          echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+          echo "Bumping from ${LATEST_TAG} to ${NEW_TAG}"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: version
+    if: needs.version.outputs.skipped != 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: depot-ubuntu-latest-arm
+            target: bun-linux-arm64
+            artifact: lsptkns-linux-arm64
+          - runner: depot-ubuntu-latest
+            target: bun-linux-x64
+            artifact: lsptkns-linux-x64
+          - runner: depot-macos-latest
+            target: bun-darwin-arm64
+            artifact: lsptkns-darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build binary
+        run: |
+          bun build src/bin.ts \
+            --compile \
+            --minify \
+            --target=${{ matrix.target }} \
+            --outfile ${{ matrix.artifact }}
+
+      - name: Compress binary
+        run: |
+          tar -czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  release:
+    name: Create release
+    needs: [version, build]
+    if: needs.version.outputs.skipped != 'true'
+    runs-on: depot-ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update package.json version
+        run: |
+          VERSION=${{ needs.version.outputs.version }}
+          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git diff --cached --quiet || git commit -m "chore: bump version to ${{ needs.version.outputs.version }}"
+          git push
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          for dir in */; do
+            for f in "$dir"*.tar.gz; do
+              sha256sum "$f" >> checksums.txt
+            done
+          done
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=${{ needs.version.outputs.tag }}
+          VERSION=${{ needs.version.outputs.version }}
+
+          # Collect release notes from commits since last tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            NOTES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" --no-merges)
+          else
+            NOTES=$(git log --pretty=format:"- %s" --no-merges)
+          fi
+
+          # Create the tag
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          # Create release with all artifacts
+          gh release create "$TAG" \
+            --title "lsptkns ${VERSION}" \
+            --notes "## Changes
+
+          ${NOTES}
+
+          ## Installation
+
+          ### Homebrew (macOS/Linux)
+          \`\`\`bash
+          brew install context-labs/lsp-tkn-grep/lsptkns
+          \`\`\`
+
+          ### Manual download
+          Download the binary for your platform, extract, and place in your \$PATH." \
+            artifacts/**/*.tar.gz \
+            artifacts/checksums.txt
+
+  update-homebrew:
+    name: Update Homebrew formula
+    needs: [version, release]
+    if: needs.version.outputs.skipped != 'true'
+    runs-on: depot-ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Calculate SHA256 sums
+        id: shas
+        run: |
+          SHA_DARWIN_ARM64=$(sha256sum artifacts/lsptkns-darwin-arm64/lsptkns-darwin-arm64.tar.gz | awk '{print $1}')
+          SHA_LINUX_X64=$(sha256sum artifacts/lsptkns-linux-x64/lsptkns-linux-x64.tar.gz | awk '{print $1}')
+          SHA_LINUX_ARM64=$(sha256sum artifacts/lsptkns-linux-arm64/lsptkns-linux-arm64.tar.gz | awk '{print $1}')
+
+          echo "darwin_arm64=${SHA_DARWIN_ARM64}" >> "$GITHUB_OUTPUT"
+          echo "linux_x64=${SHA_LINUX_X64}" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=${SHA_LINUX_ARM64}" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew formula
+        run: |
+          VERSION=${{ needs.version.outputs.version }}
+          TAG=${{ needs.version.outputs.tag }}
+
+          cat > homebrew/lsptkns.rb << FORMULA
+          class Lsptkns < Formula
+            desc "LSP-powered code analysis CLI - find symbols, trace references, build call graphs"
+            homepage "https://github.com/context-labs/lsp-tkn-grep"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              url "https://github.com/context-labs/lsp-tkn-grep/releases/download/${TAG}/lsptkns-darwin-arm64.tar.gz"
+              sha256 "${{ steps.shas.outputs.darwin_arm64 }}"
+
+              def install
+                bin.install "lsptkns-darwin-arm64" => "lsptkns"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/context-labs/lsp-tkn-grep/releases/download/${TAG}/lsptkns-linux-arm64.tar.gz"
+                sha256 "${{ steps.shas.outputs.linux_arm64 }}"
+
+                def install
+                  bin.install "lsptkns-linux-arm64" => "lsptkns"
+                end
+              else
+                url "https://github.com/context-labs/lsp-tkn-grep/releases/download/${TAG}/lsptkns-linux-x64.tar.gz"
+                sha256 "${{ steps.shas.outputs.linux_x64 }}"
+
+                def install
+                  bin.install "lsptkns-linux-x64" => "lsptkns"
+                end
+              end
+            end
+
+            test do
+              assert_match "lsptkns", shell_output("#{bin}/lsptkns --help")
+            end
+          end
+          FORMULA
+
+      - name: Commit formula update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add homebrew/lsptkns.rb
+          git diff --cached --quiet || git commit -m "chore: update homebrew formula to ${{ needs.version.outputs.version }}"
+          git push
