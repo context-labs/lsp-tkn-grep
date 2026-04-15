@@ -45,7 +45,7 @@ jobs:
       - name: Generate current snapshot
         run: |
           mkdir -p snapshots
-          bun run lsptkns symbols -w . -l typescript --cache-dir .lsptkns-cache > snapshots/after.json
+          bun run src/bin.ts symbols -w . -l typescript --cache-dir .lsptkns-cache > snapshots/after.json
 
       - name: Generate previous snapshot from parent commit
         if: ${{ hashFiles('snapshots/before.json') == '' }}
@@ -53,7 +53,7 @@ jobs:
           git worktree add ../prev-commit HEAD~1
           cd ../prev-commit
           bun install --frozen-lockfile
-          bun run lsptkns symbols -w . -l typescript > ${{ github.workspace }}/snapshots/before.json
+          bun run src/bin.ts symbols -w . -l typescript > ${{ github.workspace }}/snapshots/before.json
           cd ${{ github.workspace }}
           git worktree remove ../prev-commit
 
