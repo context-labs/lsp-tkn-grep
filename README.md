@@ -6,36 +6,16 @@ Supports **TypeScript**, **Python**, and **Elixir** out of the box. The compiled
 
 ## Install
 
-### Homebrew (macOS / Linux)
-
 ```bash
-brew install context-labs/lsp-tkn-grep/lsptkns
+curl -fsSL https://raw.githubusercontent.com/context-labs/lsp-tkn-grep/main/install.sh | sh
 ```
 
-This automatically taps the repo and installs `lsptkns` along with the required language servers (`typescript-language-server`, `pyright`, `elixir-ls`).
+This downloads the latest binary for your platform and installs it to `~/.lsptkns/bin/`. The script automatically adds it to your PATH.
 
-To upgrade:
-
-```bash
-brew upgrade lsptkns
-```
-
-### Manual download
-
-Download the binary for your platform from the [latest release](https://github.com/context-labs/lsp-tkn-grep/releases/latest), extract it, and place it somewhere in your `$PATH`:
+To update:
 
 ```bash
-# macOS (Apple Silicon)
-curl -L https://github.com/context-labs/lsp-tkn-grep/releases/latest/download/lsptkns-darwin-arm64.tar.gz | tar xz
-sudo mv lsptkns-darwin-arm64 /usr/local/bin/lsptkns
-
-# Linux x64
-curl -L https://github.com/context-labs/lsp-tkn-grep/releases/latest/download/lsptkns-linux-x64.tar.gz | tar xz
-sudo mv lsptkns-linux-x64 /usr/local/bin/lsptkns
-
-# Linux ARM64
-curl -L https://github.com/context-labs/lsp-tkn-grep/releases/latest/download/lsptkns-linux-arm64.tar.gz | tar xz
-sudo mv lsptkns-linux-arm64 /usr/local/bin/lsptkns
+lsptkns update
 ```
 
 ### From source
@@ -51,12 +31,12 @@ bun link  # makes `lsptkns` available globally
 
 ## Prerequisites
 
-`lsptkns` communicates with language servers over stdio. If you installed via Homebrew, these are already installed as dependencies. Otherwise, install the servers for the languages you need:
+`lsptkns` communicates with language servers over stdio. Install the servers for the languages you need:
 
 | Language | Server | Install |
 |----------|--------|---------|
-| TypeScript / JavaScript | `typescript-language-server` | `brew install typescript-language-server` or `npm install -g typescript-language-server typescript` |
-| Python | `pyright-langserver` | `brew install pyright` or `pip install pyright` |
+| TypeScript / JavaScript | `typescript-language-server` | `npm install -g typescript-language-server typescript` |
+| Python | `pyright-langserver` | `pip install pyright` |
 | Elixir | `elixir-ls` | `brew install elixir-ls` |
 
 Use `--server-path <path>` on any command to point at a custom server binary not in the registry.
@@ -205,10 +185,9 @@ bun run typecheck     # type check
 
 Releases are automated via GitHub Actions. On every push to `main`:
 
-1. Version is bumped based on commit message prefixes (`feat:` = minor, `fix:` = patch, `BREAKING:` / `feat!:` = major)
-2. Standalone binaries are compiled for macOS (ARM64, x64) and Linux (x64, ARM64)
-3. A GitHub Release is created with the binaries and checksums
-4. The Homebrew formula in `HomebrewFormula/lsptkns.rb` is updated with new download URLs and SHA256 sums
+1. Patch version is bumped in `package.json`
+2. Standalone binaries are compiled for macOS (ARM64) and Linux (x64, ARM64)
+3. A GitHub Release is created with the binaries
 
 ## License
 
