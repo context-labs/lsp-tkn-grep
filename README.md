@@ -18,6 +18,14 @@ To update:
 lsptkns update
 ```
 
+### Claude Code skill
+
+If you use [Claude Code](https://claude.ai/claude-code), install the lsptkns skill so Claude knows how to use the CLI:
+
+```bash
+npx skills install context-labs/lsp-tkn-grep/skills/lsptkns
+```
+
 ### From source
 
 Requires [Bun](https://bun.sh):
