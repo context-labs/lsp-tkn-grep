@@ -59,7 +59,7 @@ jobs:
 
       - name: Compute semantic diff
         run: |
-          DIFF_OUTPUT=$(bun run lsptkns diff snapshots/before.json snapshots/after.json --format human)
+          DIFF_OUTPUT=$(bun run src/bin.ts diff snapshots/before.json snapshots/after.json --format human)
           {
             echo "## Semantic Diff"
             echo ""
