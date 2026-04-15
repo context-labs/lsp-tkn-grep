@@ -9,6 +9,7 @@ import { buildCallGraph } from "../graph/builder.ts";
 import { toDot } from "../graph/output.ts";
 import { outputJson } from "../output/json.ts";
 import { formatGraphHuman } from "../output/formatter.ts";
+import { createSymbolCache, contentHash } from "../cache/symbol-cache.ts";
 
 interface WorkspaceSymbolResult {
   name: string;
@@ -83,6 +84,7 @@ export const graphCommand = new Command("graph")
   .option("-f, --file <path>", "Filter entry symbol to a specific file")
   .option("-k, --kind <kind>", "Filter entry symbol by kind")
   .option("--server-path <path>", "Override LSP server binary path")
+  .option("--cache-dir <path>", "Directory for symbol cache")
   .option("--format <format>", "Output format: json, dot, or human", "json")
   .option("--verbose", "Enable verbose LSP logging", false)
   .addHelpText(
@@ -138,49 +140,93 @@ Examples:
         // Discover all functions/methods and use them as entry points
         const config = getServerConfig(opts.language);
         const files = await walkFiles(workDir, config.extensions);
+        const cache = opts.cacheDir ? createSymbolCache(opts.cacheDir) : null;
+
+        type DocSym = {
+          name: string;
+          kind: number;
+          selectionRange: { start: { line: number; character: number } };
+          children?: DocSym[];
+        };
 
         for (const filePath of files) {
           const uri = fileUri(filePath);
           const text = await Bun.file(filePath).text();
-          client.didOpen(uri, opts.language, text);
 
-          const docSymbols = (await client.documentSymbol(uri)) as Array<{
-            name: string;
-            kind: number;
-            selectionRange: { start: { line: number; character: number } };
-            children?: Array<{
-              name: string;
-              kind: number;
-              selectionRange: { start: { line: number; character: number } };
-            }>;
-          }>;
-
-          // Collect functions and methods
-          const functionKinds = [6, 12]; // Method = 6, Function = 12
-          for (const sym of docSymbols) {
-            if (functionKinds.includes(sym.kind)) {
-              const items = await client.prepareCallHierarchy(
-                uri,
-                sym.selectionRange.start.line,
-                sym.selectionRange.start.character
+          let docSymbols: DocSym[];
+          if (cache) {
+            const hash = contentHash(text);
+            const cached = await cache.get(
+              filePath.startsWith(workDir)
+                ? filePath.slice(workDir.length + 1)
+                : filePath,
+              hash
+            );
+            if (cached) {
+              docSymbols = cached as DocSym[];
+            } else {
+              client.didOpen(uri, opts.language, text);
+              docSymbols = (await client.documentSymbol(uri)) as DocSym[];
+              client.didClose(uri);
+              await cache.set(
+                filePath.startsWith(workDir)
+                  ? filePath.slice(workDir.length + 1)
+                  : filePath,
+                hash,
+                docSymbols
               );
-              entryItems.push(...items);
             }
-            if (sym.children) {
-              for (const child of sym.children) {
-                if (functionKinds.includes(child.kind)) {
-                  const items = await client.prepareCallHierarchy(
-                    uri,
-                    child.selectionRange.start.line,
-                    child.selectionRange.start.character
-                  );
-                  entryItems.push(...items);
+          } else {
+            client.didOpen(uri, opts.language, text);
+            docSymbols = (await client.documentSymbol(uri)) as DocSym[];
+            client.didClose(uri);
+          }
+
+          // Collect functions and methods — prepareCallHierarchy needs
+          // the file open, so re-open if we got a cache hit
+          const functionKinds = [6, 12]; // Method = 6, Function = 12
+          const hasFunctions = docSymbols.some(
+            (s) =>
+              functionKinds.includes(s.kind) ||
+              s.children?.some((c) => functionKinds.includes(c.kind))
+          );
+
+          if (hasFunctions) {
+            // Ensure file is open for prepareCallHierarchy
+            client.didOpen(uri, opts.language, text);
+            for (const sym of docSymbols) {
+              if (functionKinds.includes(sym.kind)) {
+                const items = await client.prepareCallHierarchy(
+                  uri,
+                  sym.selectionRange.start.line,
+                  sym.selectionRange.start.character
+                );
+                entryItems.push(...items);
+              }
+              if (sym.children) {
+                for (const child of sym.children) {
+                  if (functionKinds.includes(child.kind)) {
+                    const items = await client.prepareCallHierarchy(
+                      uri,
+                      child.selectionRange.start.line,
+                      child.selectionRange.start.character
+                    );
+                    entryItems.push(...items);
+                  }
                 }
               }
             }
+            client.didClose(uri);
           }
+        }
 
-          client.didClose(uri);
+        if (cache) {
+          const currentFiles = new Set(
+            files.map((f) =>
+              f.startsWith(workDir) ? f.slice(workDir.length + 1) : f
+            )
+          );
+          await cache.prune(currentFiles);
         }
       }
 

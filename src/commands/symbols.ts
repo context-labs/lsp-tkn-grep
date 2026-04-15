@@ -6,6 +6,8 @@ import { getServerConfig } from "../lsp/servers.ts";
 import { fileUri, uriToPath, walkFiles } from "../utils/files.ts";
 import { outputJson } from "../output/json.ts";
 import { formatSymbolsHuman } from "../output/formatter.ts";
+import { createSymbolCache, contentHash } from "../cache/symbol-cache.ts";
+import type { LSPCoreClient } from "../lsp/core-client.ts";
 
 // Hierarchical format (DocumentSymbol) — has range directly
 interface DocumentSymbolResult {
@@ -90,6 +92,22 @@ function symbolInformationToInfo(
   };
 }
 
+function rawToSymbolInfos(
+  docSymbols: unknown[],
+  relativePath: string,
+  workDir: string
+): SymbolInfo[] {
+  const result: SymbolInfo[] = [];
+  for (const ds of docSymbols) {
+    if (isSymbolInformation(ds)) {
+      result.push(symbolInformationToInfo(ds, workDir));
+    } else {
+      result.push(documentSymbolToInfo(ds as DocumentSymbolResult, relativePath));
+    }
+  }
+  return result;
+}
+
 function flattenSymbols(symbols: SymbolInfo[]): SymbolInfo[] {
   const result: SymbolInfo[] = [];
   for (const s of symbols) {
@@ -108,6 +126,7 @@ export const symbolsCommand = new Command("symbols")
   .option("-f, --file <glob>", "Filter to files matching a glob pattern")
   .option("-k, --kind <kind>", "Filter by symbol kind (function, class, etc.)")
   .option("--flat", "Flatten hierarchical symbols into a flat list", false)
+  .option("--cache-dir <path>", "Directory for symbol cache")
   .option("--server-path <path>", "Override LSP server binary path")
   .option("--format <format>", "Output format: json or human", "json")
   .option("--verbose", "Enable verbose LSP logging", false)
@@ -118,46 +137,88 @@ Examples:
   $ lsptkns symbols --work-dir ./my-project --language typescript
   $ lsptkns symbols -w . -l typescript --kind function
   $ lsptkns symbols -w . -l python --file "models/*.py" --format human
-  $ lsptkns symbols -w . -l elixir --flat`
+  $ lsptkns symbols -w . -l elixir --flat
+  $ lsptkns symbols -w . -l typescript --cache-dir .lsptkns-cache`
   )
   .action(async (opts) => {
     const start = performance.now();
     const workDir = path.resolve(opts.workDir);
-    const client = await createSession({
+    const config = getServerConfig(opts.language);
+    const files = await walkFiles(workDir, config.extensions);
+    const cache = opts.cacheDir ? createSymbolCache(opts.cacheDir) : null;
+
+    // Start LSP session non-blocking — it warms up while we check cache.
+    // If all files are cache hits, we just kill it at the end.
+    const sessionPromise = createSession({
       workDir: opts.workDir,
       language: opts.language,
       serverPath: opts.serverPath,
       verbose: opts.verbose,
     });
 
+    let client: LSPCoreClient | null = null;
+
     try {
       let symbols: SymbolInfo[] = [];
+      let cacheHits = 0;
+      let cacheMisses = 0;
 
-      // Walk all project files and use documentSymbol per file.
-      // workspace/symbol("") is unreliable for enumeration — language servers
-      // (especially tsserver) cap results for empty queries, returning only a
-      // small subset of symbols.
-      const config = getServerConfig(opts.language);
-      const files = await walkFiles(workDir, config.extensions);
+      // Phase 1: Read files, check cache, collect misses
+      interface FileEntry {
+        filePath: string;
+        relativePath: string;
+        text: string;
+        hash: string;
+      }
+      const misses: FileEntry[] = [];
 
       for (const filePath of files) {
-        const uri = fileUri(filePath);
         const relativePath = filePath.startsWith(workDir)
           ? filePath.slice(workDir.length + 1)
           : filePath;
         const text = await Bun.file(filePath).text();
 
-        client.didOpen(uri, opts.language, text);
-        const docSymbols = await client.documentSymbol(uri);
-        client.didClose(uri);
-
-        for (const ds of docSymbols) {
-          if (isSymbolInformation(ds)) {
-            symbols.push(symbolInformationToInfo(ds, workDir));
-          } else {
-            symbols.push(documentSymbolToInfo(ds as DocumentSymbolResult, relativePath));
+        if (cache) {
+          const hash = contentHash(text);
+          const cached = await cache.get(relativePath, hash);
+          if (cached) {
+            cacheHits++;
+            symbols.push(...rawToSymbolInfos(cached, relativePath, workDir));
+            continue;
           }
+          cacheMisses++;
+          misses.push({ filePath, relativePath, text, hash });
+        } else {
+          misses.push({ filePath, relativePath, text, hash: "" });
         }
+      }
+
+      // Phase 2: Process cache misses via LSP
+      if (misses.length > 0) {
+        client = await sessionPromise;
+
+        for (const { filePath, relativePath, text, hash } of misses) {
+          const uri = fileUri(filePath);
+          client.didOpen(uri, opts.language, text);
+          const docSymbols = await client.documentSymbol(uri);
+          client.didClose(uri);
+
+          if (cache) {
+            await cache.set(relativePath, hash, docSymbols);
+          }
+
+          symbols.push(...rawToSymbolInfos(docSymbols, relativePath, workDir));
+        }
+      }
+
+      // Phase 3: Prune cache entries for deleted files
+      if (cache) {
+        const currentFiles = new Set(
+          files.map((f) =>
+            f.startsWith(workDir) ? f.slice(workDir.length + 1) : f
+          )
+        );
+        await cache.prune(currentFiles);
       }
 
       // Apply filters
@@ -176,7 +237,6 @@ Examples:
 
       if (opts.flat) {
         symbols = flattenSymbols(symbols);
-        // Remove children from flattened entries
         symbols = symbols.map(({ children, ...rest }) => rest);
       }
 
@@ -191,10 +251,16 @@ Examples:
           workDir: opts.workDir,
           language: opts.language,
           results: symbols,
-          meta: { duration_ms: duration },
+          meta: {
+            duration_ms: duration,
+            ...(cache
+              ? { cache_hits: cacheHits, cache_misses: cacheMisses }
+              : {}),
+          },
         });
       }
     } finally {
+      if (!client) client = await sessionPromise;
       await destroySession(client);
     }
   });
