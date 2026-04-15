@@ -7,19 +7,7 @@ import { fileUri, uriToPath, walkFiles } from "../utils/files.ts";
 import { outputJson } from "../output/json.ts";
 import { formatSymbolsHuman } from "../output/formatter.ts";
 
-interface WorkspaceSymbolResult {
-  name: string;
-  kind: number;
-  location: {
-    uri: string;
-    range: {
-      start: { line: number; character: number };
-      end: { line: number; character: number };
-    };
-  };
-  containerName?: string;
-}
-
+// Hierarchical format (DocumentSymbol) — has range directly
 interface DocumentSymbolResult {
   name: string;
   kind: number;
@@ -34,25 +22,29 @@ interface DocumentSymbolResult {
   children?: DocumentSymbolResult[];
 }
 
-function workspaceSymbolToInfo(raw: WorkspaceSymbolResult, workDir: string): SymbolInfo {
-  const filePath = uriToPath(raw.location.uri);
-  const relativePath = filePath.startsWith(workDir)
-    ? filePath.slice(workDir.length + 1)
-    : filePath;
-
-  return {
-    name: raw.name,
-    kind: raw.kind,
-    kindName: symbolKindName(raw.kind),
-    location: {
-      file: relativePath,
-      line: raw.location.range.start.line + 1,
-      col: raw.location.range.start.character + 1,
-      endLine: raw.location.range.end.line + 1,
-      endCol: raw.location.range.end.character + 1,
-    },
-    containerName: raw.containerName,
+// Flat format (SymbolInformation) — has location.uri + location.range
+interface SymbolInformationResult {
+  name: string;
+  kind: number;
+  location: {
+    uri: string;
+    range: {
+      start: { line: number; character: number };
+      end: { line: number; character: number };
+    };
   };
+  containerName?: string;
+}
+
+function isSymbolInformation(
+  raw: unknown
+): raw is SymbolInformationResult {
+  return (
+    typeof raw === "object" &&
+    raw !== null &&
+    "location" in raw &&
+    typeof (raw as Record<string, unknown>).location === "object"
+  );
 }
 
 function documentSymbolToInfo(
@@ -71,6 +63,30 @@ function documentSymbolToInfo(
       endCol: raw.range.end.character + 1,
     },
     children: raw.children?.map((c) => documentSymbolToInfo(c, relativePath)),
+  };
+}
+
+function symbolInformationToInfo(
+  raw: SymbolInformationResult,
+  workDir: string
+): SymbolInfo {
+  const filePath = uriToPath(raw.location.uri);
+  const relativePath = filePath.startsWith(workDir)
+    ? filePath.slice(workDir.length + 1)
+    : filePath;
+
+  return {
+    name: raw.name,
+    kind: raw.kind,
+    kindName: symbolKindName(raw.kind),
+    location: {
+      file: relativePath,
+      line: raw.location.range.start.line + 1,
+      col: raw.location.range.start.character + 1,
+      endLine: raw.location.range.end.line + 1,
+      endCol: raw.location.range.end.character + 1,
+    },
+    containerName: raw.containerName,
   };
 }
 
@@ -117,29 +133,29 @@ Examples:
     try {
       let symbols: SymbolInfo[] = [];
 
-      // Try workspace/symbol first with empty query
-      const rawResults = (await client.workspaceSymbol("")) as WorkspaceSymbolResult[];
+      // Walk all project files and use documentSymbol per file.
+      // workspace/symbol("") is unreliable for enumeration — language servers
+      // (especially tsserver) cap results for empty queries, returning only a
+      // small subset of symbols.
+      const config = getServerConfig(opts.language);
+      const files = await walkFiles(workDir, config.extensions);
 
-      if (rawResults.length > 0) {
-        symbols = rawResults.map((r) => workspaceSymbolToInfo(r, workDir));
-      } else {
-        // Fallback: walk files and use documentSymbol per file
-        const config = getServerConfig(opts.language);
-        const files = await walkFiles(workDir, config.extensions);
+      for (const filePath of files) {
+        const uri = fileUri(filePath);
+        const relativePath = filePath.startsWith(workDir)
+          ? filePath.slice(workDir.length + 1)
+          : filePath;
+        const text = await Bun.file(filePath).text();
 
-        for (const filePath of files) {
-          const uri = fileUri(filePath);
-          const relativePath = filePath.startsWith(workDir)
-            ? filePath.slice(workDir.length + 1)
-            : filePath;
-          const text = await Bun.file(filePath).text();
+        client.didOpen(uri, opts.language, text);
+        const docSymbols = await client.documentSymbol(uri);
+        client.didClose(uri);
 
-          client.didOpen(uri, opts.language, text);
-          const docSymbols = (await client.documentSymbol(uri)) as DocumentSymbolResult[];
-          client.didClose(uri);
-
-          for (const ds of docSymbols) {
-            symbols.push(documentSymbolToInfo(ds, relativePath));
+        for (const ds of docSymbols) {
+          if (isSymbolInformation(ds)) {
+            symbols.push(symbolInformationToInfo(ds, workDir));
+          } else {
+            symbols.push(documentSymbolToInfo(ds as DocumentSymbolResult, relativePath));
           }
         }
       }

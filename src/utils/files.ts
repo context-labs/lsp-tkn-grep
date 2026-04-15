@@ -14,6 +14,26 @@ export async function readFileText(filePath: string): Promise<string> {
   return file.text();
 }
 
+const EXCLUDED_DIRS = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  ".next",
+  ".nuxt",
+  ".turbo",
+  ".output",
+  "coverage",
+  "__pycache__",
+  ".git",
+  "deps",
+  "_build",
+]);
+
+function isExcluded(relPath: string): boolean {
+  const parts = relPath.split(path.sep);
+  return parts.some((p) => EXCLUDED_DIRS.has(p));
+}
+
 export async function walkFiles(
   workDir: string,
   extensions: string[]
@@ -26,7 +46,9 @@ export async function walkFiles(
       cwd: workDir,
       onlyFiles: true,
     })) {
-      files.push(path.join(workDir, match));
+      if (!isExcluded(match)) {
+        files.push(path.join(workDir, match));
+      }
     }
   }
 

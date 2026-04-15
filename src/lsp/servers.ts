@@ -26,6 +26,12 @@ export const SERVER_REGISTRY: Record<string, ServerConfig> = {
     installHint: "brew install elixir-ls",
     quirks: "Requires mix.exs in work-dir. First run is slow (compilation).",
   },
+  protobuf: {
+    command: "buf",
+    args: ["lsp", "serve"],
+    extensions: [".proto"],
+    installHint: "brew install buf",
+  },
 };
 
 export function getServerConfig(language: string): ServerConfig {

@@ -1,4 +1,4 @@
-import type { LspTknsClient } from "../lsp/client.ts";
+import type { LSPCoreClient } from "../lsp/core-client.ts";
 import type { CallGraph, GraphEdge, GraphNode } from "../types/graph.ts";
 import type { SymbolInfo } from "../types/symbol.ts";
 import { symbolKindName } from "../types/symbol.ts";
@@ -38,7 +38,7 @@ function itemToSymbolInfo(item: CallHierarchyItem): SymbolInfo {
 }
 
 export async function buildCallGraph(
-  client: LspTknsClient,
+  client: LSPCoreClient,
   entryItems: CallHierarchyItem[],
   maxDepth: number = 3
 ): Promise<CallGraph> {
