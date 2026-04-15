@@ -83,6 +83,12 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Set version in package.json
+        run: |
+          VERSION=${{ needs.version.outputs.version }}
+          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
+          mv package.json.tmp package.json
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
@@ -111,20 +117,6 @@ jobs:
     runs-on: depot-ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Update package.json version
-        run: |
-          VERSION=${{ needs.version.outputs.version }}
-          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
-          mv package.json.tmp package.json
-
-      - name: Commit version bump
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json
-          git diff --cached --quiet || git commit -m "chore: bump version to ${{ needs.version.outputs.version }}"
-          git push
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -180,7 +172,7 @@ jobs:
             artifacts/checksums.txt
 
   update-homebrew:
-    name: Update Homebrew formula
+    name: Update Homebrew formula and version
     needs: [version, release]
     if: needs.version.outputs.skipped != 'true'
     runs-on: depot-ubuntu-latest
@@ -205,17 +197,27 @@ jobs:
           echo "linux_x64=${SHA_LINUX_X64}" >> "$GITHUB_OUTPUT"
           echo "linux_arm64=${SHA_LINUX_ARM64}" >> "$GITHUB_OUTPUT"
 
+      - name: Update package.json version
+        run: |
+          VERSION=${{ needs.version.outputs.version }}
+          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
+          mv package.json.tmp package.json
+
       - name: Update Homebrew formula
         run: |
           VERSION=${{ needs.version.outputs.version }}
           TAG=${{ needs.version.outputs.tag }}
 
-          cat > homebrew/lsptkns.rb << FORMULA
+          cat > HomebrewFormula/lsptkns.rb << FORMULA
           class Lsptkns < Formula
             desc "LSP-powered code analysis CLI - find symbols, trace references, build call graphs"
             homepage "https://github.com/context-labs/lsp-tkn-grep"
             version "${VERSION}"
             license "MIT"
+
+            depends_on "typescript-language-server"
+            depends_on "pyright"
+            depends_on "elixir-ls"
 
             on_macos do
               url "https://github.com/context-labs/lsp-tkn-grep/releases/download/${TAG}/lsptkns-darwin-arm64.tar.gz"
@@ -250,10 +252,10 @@ jobs:
           end
           FORMULA
 
-      - name: Commit formula update
+      - name: Commit version bump and formula update
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add homebrew/lsptkns.rb
-          git diff --cached --quiet || git commit -m "chore: update homebrew formula to ${{ needs.version.outputs.version }}"
+          git add package.json HomebrewFormula/lsptkns.rb
+          git diff --cached --quiet || git commit -m "chore: release ${{ needs.version.outputs.version }}"
           git push

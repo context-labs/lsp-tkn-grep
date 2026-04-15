@@ -4,6 +4,10 @@ class Lsptkns < Formula
   version "0.1.0"
   license "MIT"
 
+  depends_on "typescript-language-server"
+  depends_on "pyright"
+  depends_on "elixir-ls"
+
   on_macos do
     url "https://github.com/context-labs/lsp-tkn-grep/releases/download/v0.1.0/lsptkns-darwin-arm64.tar.gz"
     sha256 "c77d99dbcf57c5f81f1b1caee164915a042db419f838297bcd35b911960b4121"
