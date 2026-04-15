@@ -46,7 +46,8 @@ export class LSPCoreClient {
    */
   static async spawn(
     opts: LSPClientOptions,
-    ClientClass: typeof LSPCoreClient
+    ClientClass: typeof LSPCoreClient,
+    spawnOpts?: { skipReady?: boolean }
   ): Promise<LSPCoreClient> {
     const { workDir, language, serverPath, verbose = false } = opts;
     const config = getServerConfig(language);
@@ -93,7 +94,9 @@ export class LSPCoreClient {
     );
 
     await client.initialize();
-    await client.waitForReady();
+    if (!spawnOpts?.skipReady) {
+      await client.waitForReady();
+    }
 
     return client;
   }

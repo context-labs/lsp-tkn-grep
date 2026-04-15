@@ -1,13 +1,16 @@
 import { Command } from "commander";
 import path from "node:path";
-import { createSession, destroySession } from "../lsp/lifecycle.ts";
 import { symbolKindName, parseSymbolKind, type SymbolInfo } from "../types/symbol.ts";
 import { getServerConfig } from "../lsp/servers.ts";
-import { fileUri, uriToPath, walkFiles } from "../utils/files.ts";
+import { uriToPath, walkFiles } from "../utils/files.ts";
 import { outputJson } from "../output/json.ts";
 import { formatSymbolsHuman } from "../output/formatter.ts";
 import { createSymbolCache, contentHash } from "../cache/symbol-cache.ts";
-import type { LSPCoreClient } from "../lsp/core-client.ts";
+import {
+  processFilesParallel,
+  autoWorkerCount,
+  type FileEntry,
+} from "../utils/worker-pool.ts";
 
 // Hierarchical format (DocumentSymbol) — has range directly
 interface DocumentSymbolResult {
@@ -102,7 +105,9 @@ function rawToSymbolInfos(
     if (isSymbolInformation(ds)) {
       result.push(symbolInformationToInfo(ds, workDir));
     } else {
-      result.push(documentSymbolToInfo(ds as DocumentSymbolResult, relativePath));
+      result.push(
+        documentSymbolToInfo(ds as DocumentSymbolResult, relativePath)
+      );
     }
   }
   return result;
@@ -122,11 +127,15 @@ function flattenSymbols(symbols: SymbolInfo[]): SymbolInfo[] {
 export const symbolsCommand = new Command("symbols")
   .description("List all symbols in a project")
   .requiredOption("-w, --work-dir <dir>", "Project root directory", ".")
-  .requiredOption("-l, --language <lang>", "Language (typescript, python, elixir)")
+  .requiredOption(
+    "-l, --language <lang>",
+    "Language (typescript, python, elixir)"
+  )
   .option("-f, --file <glob>", "Filter to files matching a glob pattern")
   .option("-k, --kind <kind>", "Filter by symbol kind (function, class, etc.)")
   .option("--flat", "Flatten hierarchical symbols into a flat list", false)
   .option("--cache-dir <path>", "Directory for symbol cache")
+  .option("--workers <n>", "Parallel LSP workers (default: auto)", "auto")
   .option("--server-path <path>", "Override LSP server binary path")
   .option("--format <format>", "Output format: json or human", "json")
   .option("--verbose", "Enable verbose LSP logging", false)
@@ -138,7 +147,8 @@ Examples:
   $ lsptkns symbols -w . -l typescript --kind function
   $ lsptkns symbols -w . -l python --file "models/*.py" --format human
   $ lsptkns symbols -w . -l elixir --flat
-  $ lsptkns symbols -w . -l typescript --cache-dir .lsptkns-cache`
+  $ lsptkns symbols -w . -l typescript --cache-dir .lsptkns-cache
+  $ lsptkns symbols -w . -l typescript --workers 4`
   )
   .action(async (opts) => {
     const start = performance.now();
@@ -147,121 +157,116 @@ Examples:
     const files = await walkFiles(workDir, config.extensions);
     const cache = opts.cacheDir ? createSymbolCache(opts.cacheDir) : null;
 
-    // Start LSP session non-blocking — it warms up while we check cache.
-    // If all files are cache hits, we just kill it at the end.
-    const sessionPromise = createSession({
-      workDir: opts.workDir,
-      language: opts.language,
-      serverPath: opts.serverPath,
-      verbose: opts.verbose,
-    });
+    let symbols: SymbolInfo[] = [];
+    let cacheHits = 0;
+    let cacheMisses = 0;
 
-    let client: LSPCoreClient | null = null;
+    // Phase 1: Read files, check cache, collect misses
+    const misses: FileEntry[] = [];
 
-    try {
-      let symbols: SymbolInfo[] = [];
-      let cacheHits = 0;
-      let cacheMisses = 0;
+    for (const filePath of files) {
+      const relativePath = filePath.startsWith(workDir)
+        ? filePath.slice(workDir.length + 1)
+        : filePath;
+      const text = await Bun.file(filePath).text();
 
-      // Phase 1: Read files, check cache, collect misses
-      interface FileEntry {
-        filePath: string;
-        relativePath: string;
-        text: string;
-        hash: string;
-      }
-      const misses: FileEntry[] = [];
-
-      for (const filePath of files) {
-        const relativePath = filePath.startsWith(workDir)
-          ? filePath.slice(workDir.length + 1)
-          : filePath;
-        const text = await Bun.file(filePath).text();
-
-        if (cache) {
-          const hash = contentHash(text);
-          const cached = await cache.get(relativePath, hash);
-          if (cached) {
-            cacheHits++;
-            symbols.push(...rawToSymbolInfos(cached, relativePath, workDir));
-            continue;
-          }
-          cacheMisses++;
-          misses.push({ filePath, relativePath, text, hash });
-        } else {
-          misses.push({ filePath, relativePath, text, hash: "" });
+      if (cache) {
+        const hash = contentHash(text);
+        const cached = await cache.get(relativePath, hash);
+        if (cached) {
+          cacheHits++;
+          symbols.push(...rawToSymbolInfos(cached, relativePath, workDir));
+          continue;
         }
+        cacheMisses++;
+        misses.push({ filePath, relativePath, text, hash });
+      } else {
+        misses.push({ filePath, relativePath, text, hash: "" });
+      }
+    }
+
+    // Phase 2: Process cache misses via parallel LSP workers
+    if (misses.length > 0) {
+      const workerCount =
+        opts.workers === "auto"
+          ? autoWorkerCount(misses.length)
+          : parseInt(opts.workers, 10);
+
+      if (opts.verbose) {
+        console.error(
+          `[lsptkns] ${misses.length} cache misses, using ${workerCount} worker(s)`
+        );
       }
 
-      // Phase 2: Process cache misses via LSP
-      if (misses.length > 0) {
-        client = await sessionPromise;
+      const lspOpts = {
+        workDir: opts.workDir,
+        language: opts.language,
+        serverPath: opts.serverPath,
+        verbose: opts.verbose,
+      };
 
-        for (const { filePath, relativePath, text, hash } of misses) {
-          const uri = fileUri(filePath);
-          client.didOpen(uri, opts.language, text);
-          const docSymbols = await client.documentSymbol(uri);
-          client.didClose(uri);
+      const results = await processFilesParallel(
+        misses,
+        lspOpts,
+        workerCount,
+        cache
+      );
 
-          if (cache) {
-            await cache.set(relativePath, hash, docSymbols);
-          }
-
+      for (const { relativePath } of misses) {
+        const docSymbols = results.get(relativePath);
+        if (docSymbols) {
           symbols.push(...rawToSymbolInfos(docSymbols, relativePath, workDir));
         }
       }
+    }
 
-      // Phase 3: Prune cache entries for deleted files
-      if (cache) {
-        const currentFiles = new Set(
-          files.map((f) =>
-            f.startsWith(workDir) ? f.slice(workDir.length + 1) : f
-          )
-        );
-        await cache.prune(currentFiles);
+    // Phase 3: Prune cache entries for deleted files
+    if (cache) {
+      const currentFiles = new Set(
+        files.map((f) =>
+          f.startsWith(workDir) ? f.slice(workDir.length + 1) : f
+        )
+      );
+      await cache.prune(currentFiles);
+    }
+
+    // Apply filters
+    if (opts.file) {
+      const fileGlob = new Bun.Glob(opts.file);
+      symbols = symbols.filter((s) => fileGlob.match(s.location.file));
+    }
+
+    if (opts.kind) {
+      const kind = parseSymbolKind(opts.kind);
+      if (kind === undefined) {
+        throw new Error(`Unknown symbol kind: "${opts.kind}"`);
       }
+      symbols = filterByKind(symbols, kind);
+    }
 
-      // Apply filters
-      if (opts.file) {
-        const fileGlob = new Bun.Glob(opts.file);
-        symbols = symbols.filter((s) => fileGlob.match(s.location.file));
-      }
+    if (opts.flat) {
+      symbols = flattenSymbols(symbols);
+      symbols = symbols.map(({ children, ...rest }) => rest);
+    }
 
-      if (opts.kind) {
-        const kind = parseSymbolKind(opts.kind);
-        if (kind === undefined) {
-          throw new Error(`Unknown symbol kind: "${opts.kind}"`);
-        }
-        symbols = filterByKind(symbols, kind);
-      }
+    const duration = Math.round(performance.now() - start);
 
-      if (opts.flat) {
-        symbols = flattenSymbols(symbols);
-        symbols = symbols.map(({ children, ...rest }) => rest);
-      }
-
-      const duration = Math.round(performance.now() - start);
-
-      if (opts.format === "human") {
-        const flat = opts.flat ? symbols : flattenSymbols(symbols);
-        console.log(formatSymbolsHuman(flat));
-      } else {
-        outputJson({
-          command: "symbols",
-          workDir: opts.workDir,
-          language: opts.language,
-          results: symbols,
-          meta: {
-            duration_ms: duration,
-            ...(cache
-              ? { cache_hits: cacheHits, cache_misses: cacheMisses }
-              : {}),
-          },
-        });
-      }
-    } finally {
-      if (!client) client = await sessionPromise;
-      await destroySession(client);
+    if (opts.format === "human") {
+      const flat = opts.flat ? symbols : flattenSymbols(symbols);
+      console.log(formatSymbolsHuman(flat));
+    } else {
+      outputJson({
+        command: "symbols",
+        workDir: opts.workDir,
+        language: opts.language,
+        results: symbols,
+        meta: {
+          duration_ms: duration,
+          ...(cache
+            ? { cache_hits: cacheHits, cache_misses: cacheMisses }
+            : {}),
+        },
+      });
     }
   });
 
